@@ -263,6 +263,20 @@ module hart #(
         .o_rs2_rdata (rs2_data)
     );
 
+    // Additional RF read port for retire interface (reads at WB stage)
+    wire [31:0] wb_rs1_data, wb_rs2_data;
+    rf #(.BYPASS_EN(1)) u_rf_retire (
+        .i_clk       (i_clk),
+        .i_rst       (i_rst),
+        .i_rd_wen    (mem_wb_reg_write),
+        .i_rd_waddr  (mem_wb_rd_addr),
+        .i_rd_wdata  (wb_data),
+        .i_rs1_raddr (mem_wb_rs1_addr),
+        .o_rs1_rdata (wb_rs1_data),
+        .i_rs2_raddr (mem_wb_rs2_addr),
+        .o_rs2_rdata (wb_rs2_data)
+    );
+
     //====================================================
     // 4. Control Unit (in ID stage)
     //====================================================
@@ -586,9 +600,9 @@ module hart #(
     assign o_retire_halt  = mem_wb_is_ebreak && !i_rst;
     
     assign o_retire_rs1_raddr = mem_wb_rs1_addr;
-    assign o_retire_rs1_rdata = mem_wb_rs1_data;
+    assign o_retire_rs1_rdata = wb_rs1_data;  // Read fresh from RF at WB time
     assign o_retire_rs2_raddr = mem_wb_rs2_addr;
-    assign o_retire_rs2_rdata = mem_wb_rs2_data;
+    assign o_retire_rs2_rdata = wb_rs2_data;  // Read fresh from RF at WB time
     assign o_retire_rd_waddr  = mem_wb_reg_write ? mem_wb_rd_addr : 5'd0;
     assign o_retire_rd_wdata  = mem_wb_reg_write ? wb_data : 32'd0;
     assign o_retire_pc        = mem_wb_pc;
