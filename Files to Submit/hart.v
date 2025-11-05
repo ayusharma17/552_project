@@ -124,7 +124,15 @@ module hart #(
     // the next program counter after the instruction is retired. For most
     // instructions, this is `o_retire_pc + 4`, but must be the branch or jump
     // target for *taken* branches and jumps.
-    output wire [31:0] o_retire_next_pc
+    output wire [31:0] o_retire_next_pc,
+    
+    // Data memory retire interface (for load/store instructions)
+    output wire [31:0] o_retire_dmem_addr,
+    output wire        o_retire_dmem_ren,
+    output wire        o_retire_dmem_wen,
+    output wire [ 3:0] o_retire_dmem_mask,
+    output wire [31:0] o_retire_dmem_wdata,
+    output wire [31:0] o_retire_dmem_rdata
 
 
 `ifdef RISCV_FORMAL
@@ -308,23 +316,82 @@ module hart #(
     );
 
     //====================================================
-    // 6. Execute (EX) Stage - ALU + Branch Resolution
+    // 6. Hazard Detection Unit
+    //====================================================
+    // Detects RAW (Read-After-Write) hazards and generates stall signal
+    wire stall;
+    wire load_use_hazard;
+    wire ex_hazard_rs1, ex_hazard_rs2;
+    wire mem_hazard_rs1, mem_hazard_rs2;
+    
+    // Check if instruction in ID stage uses rs1/rs2
+    wire id_uses_rs1 = (opcode != 7'b0110111) && (opcode != 7'b0010111) && (opcode != 7'b1101111); // Not LUI, AUIPC, JAL
+    wire id_uses_rs2 = (opcode == 7'b0110011) || (opcode == 7'b0100011) || (opcode == 7'b1100011); // R-type, Store, Branch
+    
+    // With forwarding, we only need to detect load-use hazards
+    // Load-use hazard: instruction in EX is a load, and current instruction in ID needs its result
+    // This requires a 1-cycle stall because load data is only available after MEM stage
+    wire ex_load_rs1_hazard = id_uses_rs1 && id_ex_mem_read && (id_ex_rd_addr != 5'd0) && (id_ex_rd_addr == rs1_addr);
+    wire ex_load_rs2_hazard = id_uses_rs2 && id_ex_mem_read && (id_ex_rd_addr != 5'd0) && (id_ex_rd_addr == rs2_addr);
+    
+    assign load_use_hazard = ex_load_rs1_hazard || ex_load_rs2_hazard;
+    
+    // Stall only for load-use hazards (forwarding handles all other data hazards)
+    assign stall = load_use_hazard;
+
+    //====================================================
+    // 6. Forwarding Unit
+    //====================================================
+    // Compute the data to forward from EX/MEM stage
+    // For LUI, forward the immediate value (upper 20 bits << 12)
+    // For AUIPC, forward PC + immediate
+    // For JAL/JALR, forward PC+4
+    // Otherwise, forward ALU result
+    wire [31:0] pc_plus_4_mem = ex_mem_pc + 32'd4;
+    wire is_jal_mem = (ex_mem_opcode == 7'b1101111);
+    wire is_jalr_mem = (ex_mem_opcode == 7'b1100111);
+    wire [31:0] ex_mem_forward_data = (ex_mem_opcode == 7'b0110111) ? ex_mem_imm :          // LUI
+                                      (ex_mem_opcode == 7'b0010111) ? (ex_mem_pc + ex_mem_imm) : // AUIPC
+                                      (is_jal_mem || is_jalr_mem) ? pc_plus_4_mem :          // JAL/JALR
+                                      ex_mem_alu_result;                                      // ALU result
+    
+    // Forward from EX/MEM stage (EX-EX forwarding)
+    wire forward_ex_rs1 = ex_mem_reg_write && (ex_mem_rd_addr != 5'd0) && (ex_mem_rd_addr == id_ex_rs1_addr);
+    wire forward_ex_rs2 = ex_mem_reg_write && (ex_mem_rd_addr != 5'd0) && (ex_mem_rd_addr == id_ex_rs2_addr);
+    
+    // Forward from MEM/WB stage (MEM-EX forwarding)
+    wire forward_mem_rs1 = mem_wb_reg_write && (mem_wb_rd_addr != 5'd0) && (mem_wb_rd_addr == id_ex_rs1_addr);
+    wire forward_mem_rs2 = mem_wb_reg_write && (mem_wb_rd_addr != 5'd0) && (mem_wb_rd_addr == id_ex_rs2_addr);
+    
+    // Forwarding muxes for ALU operands
+    // Priority: EX-EX > MEM-EX > no forward
+    // Use ex_mem_forward_data which handles LUI/AUIPC/JAL/JALR correctly
+    wire [31:0] forward_rs1_data = forward_ex_rs1 ? ex_mem_forward_data :
+                                   forward_mem_rs1 ? wb_data :
+                                   id_ex_rs1_data;
+    
+    wire [31:0] forward_rs2_data = forward_ex_rs2 ? ex_mem_forward_data :
+                                   forward_mem_rs2 ? wb_data :
+                                   id_ex_rs2_data;
+
+    //====================================================
+    // 7. Execute (EX) Stage - ALU + Branch Resolution
     //====================================================
     wire [31:0] alu_op2;
     wire [31:0] alu_result;
     wire        alu_zero;
 
-    assign alu_op2 = (id_ex_alu_src) ? id_ex_imm : id_ex_rs2_data;
+    assign alu_op2 = (id_ex_alu_src) ? id_ex_imm : forward_rs2_data;
 
     alu u_alu (
-        .i_op1      (id_ex_rs1_data),
+        .i_op1      (forward_rs1_data),
         .i_op2      (alu_op2),
         .i_alu_ctrl (id_ex_alu_ctrl),
         .o_result   (alu_result),
         .o_zero     (alu_zero)
     );
     
-    // Branch condition evaluation in EX stage
+    // Branch condition evaluation in EX stage (uses forwarded values)
     reg branch_condition;
     wire is_jal = (id_ex_opcode == 7'b1101111);   // JAL
     wire is_jalr = (id_ex_opcode == 7'b1100111);  // JALR
@@ -333,20 +400,20 @@ module hart #(
         branch_condition = 1'b0;
         if (id_ex_branch) begin
             case (id_ex_funct3)
-                3'b000: branch_condition = (id_ex_rs1_data == id_ex_rs2_data);                     // BEQ
-                3'b001: branch_condition = (id_ex_rs1_data != id_ex_rs2_data);                     // BNE
-                3'b100: branch_condition = ($signed(id_ex_rs1_data) < $signed(id_ex_rs2_data));   // BLT
-                3'b101: branch_condition = ($signed(id_ex_rs1_data) >= $signed(id_ex_rs2_data));  // BGE
-                3'b110: branch_condition = (id_ex_rs1_data < id_ex_rs2_data);                      // BLTU
-                3'b111: branch_condition = (id_ex_rs1_data >= id_ex_rs2_data);                     // BGEU
+                3'b000: branch_condition = (forward_rs1_data == forward_rs2_data);                     // BEQ
+                3'b001: branch_condition = (forward_rs1_data != forward_rs2_data);                     // BNE
+                3'b100: branch_condition = ($signed(forward_rs1_data) < $signed(forward_rs2_data));   // BLT
+                3'b101: branch_condition = ($signed(forward_rs1_data) >= $signed(forward_rs2_data));  // BGE
+                3'b110: branch_condition = (forward_rs1_data < forward_rs2_data);                      // BLTU
+                3'b111: branch_condition = (forward_rs1_data >= forward_rs2_data);                     // BGEU
                 default: branch_condition = 1'b0;
             endcase
         end
     end
     
-    // Compute branch/jump targets in EX
+    // Compute branch/jump targets in EX (use forwarded rs1 for JALR)
     wire [31:0] branch_target = id_ex_pc + id_ex_imm;
-    wire [31:0] jalr_sum = id_ex_rs1_data + id_ex_imm;
+    wire [31:0] jalr_sum = forward_rs1_data + id_ex_imm;
     wire [31:0] jalr_target = {jalr_sum[31:1], 1'b0};
     wire        branch_taken = (id_ex_branch && branch_condition) || is_jal || is_jalr;
     
@@ -435,13 +502,17 @@ module hart #(
                      mem_wb_alu_result;                               // ALU result
 
     //====================================================
-    // 9. Next PC Logic (controlled by EX stage)
+    // 9. Next PC Logic (controlled by EX stage and hazard detection)
     //====================================================
     wire [31:0] pc_plus_4 = pc_curr + 32'd4;
     
-    // PC mux: Take branch target from EX if branch/jump taken, otherwise PC+4
+    // PC mux: Hold PC if stall, take branch if taken, otherwise PC+4
     always @* begin
-        if (branch_taken)
+        if (i_rst)
+            pc_next = RESET_ADDR;  // Hold at reset address during reset
+        else if (stall)
+            pc_next = pc_curr;  // Hold PC during stall
+        else if (branch_taken)
             pc_next = ex_branch_target;
         else
             pc_next = pc_plus_4;
@@ -452,11 +523,12 @@ module hart #(
     //====================================================
     always @(posedge i_clk) begin
         if (i_rst) begin
-            // Reset all pipeline registers to NOPs
-            if_id_pc <= 32'h0;
+            // Reset all pipeline registers to NOPs with invalid PC
+            // Use PC=0 as marker for pipeline bubbles
+            if_id_pc <= 32'hFFFFFFFF;  // Invalid PC marker
             if_id_inst <= 32'h00000013;  // NOP (addi x0, x0, 0)
             
-            id_ex_pc <= 32'h0;
+            id_ex_pc <= 32'hFFFFFFFF;  // Invalid PC marker
             id_ex_inst <= 32'h00000013;
             id_ex_rs1_data <= 32'h0;
             id_ex_rs2_data <= 32'h0;
@@ -475,7 +547,7 @@ module hart #(
             id_ex_branch <= 1'b0;
             id_ex_jump <= 1'b0;
             
-            ex_mem_pc <= 32'h0;
+            ex_mem_pc <= 32'hFFFFFFFF;  // Invalid PC marker
             ex_mem_inst <= 32'h00000013;
             ex_mem_alu_result <= 32'h0;
             ex_mem_rs2_data <= 32'h0;
@@ -493,7 +565,7 @@ module hart #(
             ex_mem_branch_target <= 32'h0;
             ex_mem_branch_taken <= 1'b0;
             
-            mem_wb_pc <= 32'h0;
+            mem_wb_pc <= 32'hFFFFFFFF;  // Invalid PC marker
             mem_wb_inst <= 32'h00000013;
             mem_wb_alu_result <= 32'h0;
             mem_wb_mem_data <= 32'h0;
@@ -514,39 +586,70 @@ module hart #(
             mem_wb_reg_write <= 1'b0;
             mem_wb_is_ebreak <= 1'b0;
         end else begin
-            // IF/ID: Fetch instruction
-            if_id_pc <= pc_curr;
-            if_id_inst <= i_imem_rdata;
+            // IF/ID: Fetch instruction (HOLD if stall, FLUSH if branch taken)
+            if (branch_taken) begin
+                // Flush IF/ID when branch is taken (instruction in IF is wrong path)
+                if_id_pc <= 32'hFFFFFFFF;  // Invalid PC for flushed instruction
+                if_id_inst <= 32'h00000013;  // NOP
+            end else if (!stall) begin
+                // Capture PC and instruction - use o_imem_raddr to ensure they match
+                if_id_pc <= o_imem_raddr;  // This is pc_curr, the address we're fetching from
+                if_id_inst <= i_imem_rdata;
+            end
+            // else: IF/ID register keeps its current value during stall
             
-            // ID/EX: Decode and read registers
-            id_ex_pc <= if_id_pc;
-            id_ex_inst <= if_id_inst;
-            id_ex_rs1_data <= rs1_data;
-            id_ex_rs2_data <= rs2_data;
-            id_ex_imm <= imm_out;
-            id_ex_rs1_addr <= rs1_addr;
-            id_ex_rs2_addr <= rs2_addr;
-            id_ex_rd_addr <= rd_addr;
-            id_ex_funct3 <= funct3;
-            id_ex_opcode <= opcode;
-            id_ex_alu_ctrl <= alu_ctrl;
-            id_ex_alu_src <= alu_src;
-            id_ex_mem_read <= mem_read;
-            id_ex_mem_write <= mem_write;
-            id_ex_mem_to_reg <= mem_to_reg;
-            id_ex_reg_write <= reg_write;
-            id_ex_branch <= branch;
-            id_ex_jump <= jump;
+            // ID/EX: Decode and read registers (INSERT BUBBLE if stall or branch taken)
+            if (stall || branch_taken) begin
+                // Insert bubble (NOP) when stalling or flushing due to branch
+                id_ex_pc <= 32'hFFFFFFFF;  // Invalid PC for bubble
+                id_ex_inst <= 32'h00000013;  // NOP
+                id_ex_rs1_data <= 32'h0;
+                id_ex_rs2_data <= 32'h0;
+                id_ex_imm <= 32'h0;
+                id_ex_rs1_addr <= 5'h0;
+                id_ex_rs2_addr <= 5'h0;
+                id_ex_rd_addr <= 5'h0;
+                id_ex_funct3 <= 3'h0;
+                id_ex_opcode <= 7'h0;
+                id_ex_alu_ctrl <= 4'h0;
+                id_ex_alu_src <= 1'b0;
+                id_ex_mem_read <= 1'b0;
+                id_ex_mem_write <= 1'b0;
+                id_ex_mem_to_reg <= 1'b0;
+                id_ex_reg_write <= 1'b0;  // Crucial: no register write for bubble
+                id_ex_branch <= 1'b0;
+                id_ex_jump <= 1'b0;
+            end else begin
+                // Normal operation: decode and forward
+                id_ex_pc <= if_id_pc;
+                id_ex_inst <= if_id_inst;
+                id_ex_rs1_data <= rs1_data;
+                id_ex_rs2_data <= rs2_data;
+                id_ex_imm <= imm_out;
+                id_ex_rs1_addr <= rs1_addr;
+                id_ex_rs2_addr <= rs2_addr;
+                id_ex_rd_addr <= rd_addr;
+                id_ex_funct3 <= funct3;
+                id_ex_opcode <= opcode;
+                id_ex_alu_ctrl <= alu_ctrl;
+                id_ex_alu_src <= alu_src;
+                id_ex_mem_read <= mem_read;
+                id_ex_mem_write <= mem_write;
+                id_ex_mem_to_reg <= mem_to_reg;
+                id_ex_reg_write <= reg_write;
+                id_ex_branch <= branch;
+                id_ex_jump <= jump;
+            end
             
             // EX/MEM: Execute ALU and resolve branches
             ex_mem_pc <= id_ex_pc;
             ex_mem_inst <= id_ex_inst;
             ex_mem_alu_result <= alu_result;
-            ex_mem_rs2_data <= id_ex_rs2_data;
+            ex_mem_rs2_data <= forward_rs2_data;  // Capture forwarded value for retire interface
             ex_mem_rd_addr <= id_ex_rd_addr;
             ex_mem_funct3 <= id_ex_funct3;
             ex_mem_opcode <= id_ex_opcode;
-            ex_mem_rs1_data <= id_ex_rs1_data;
+            ex_mem_rs1_data <= forward_rs1_data;  // Capture forwarded value for retire interface
             ex_mem_imm <= id_ex_imm;
             ex_mem_rs1_addr <= id_ex_rs1_addr;
             ex_mem_rs2_addr <= id_ex_rs2_addr;
@@ -585,28 +688,24 @@ module hart #(
     //====================================================
     // 11. Retire Interface (from WB stage)
     //====================================================
-    // Track cycles to skip initial pipeline fill NOPs
-    reg [2:0] cycle_count;
-    always @(posedge i_clk) begin
-        if (i_rst)
-            cycle_count <= 3'd0;
-        else if (cycle_count < 3'd4)
-            cycle_count <= cycle_count + 3'd1;
-    end
+    // Only retire instructions with valid PCs
+    // PC=0xFFFFFFFF marks pipeline bubbles from reset/flush  
+    // Also filter out instructions with invalid instruction encoding (all x's from reset)
+    wire mem_wb_is_bubble = (mem_wb_pc == 32'hFFFFFFFF) || (mem_wb_inst === 32'hxxxxxxxx);
     
     assign o_retire_inst  = mem_wb_inst;
-    assign o_retire_valid = (cycle_count >= 3'd4);  // Start retiring after pipeline fills
+    assign o_retire_valid = !i_rst && !mem_wb_is_bubble;
     assign o_retire_trap  = 1'b0;
     assign o_retire_halt  = mem_wb_is_ebreak && !i_rst;
     
     assign o_retire_rs1_raddr = mem_wb_rs1_addr;
-    assign o_retire_rs1_rdata = wb_rs1_data;  // Read fresh from RF at WB time
+    assign o_retire_rs1_rdata = mem_wb_rs1_data;  // Use value captured in pipeline during ID stage
     assign o_retire_rs2_raddr = mem_wb_rs2_addr;
-    assign o_retire_rs2_rdata = wb_rs2_data;  // Read fresh from RF at WB time
+    assign o_retire_rs2_rdata = mem_wb_rs2_data;  // Use value captured in pipeline during ID stage
     assign o_retire_rd_waddr  = mem_wb_reg_write ? mem_wb_rd_addr : 5'd0;
     assign o_retire_rd_wdata  = mem_wb_reg_write ? wb_data : 32'd0;
-    assign o_retire_pc        = mem_wb_pc;
-    assign o_retire_next_pc   = mem_wb_pc + 32'd4;  // Simplified for now
+    assign o_retire_pc        = mem_wb_pc - 32'd4;  // PC of instruction being retired
+    assign o_retire_next_pc   = mem_wb_pc;  // Next PC after this instruction
     
     // Retire dmem interface signals
     assign o_retire_dmem_addr  = mem_wb_dmem_addr;
