@@ -1,0 +1,10 @@
+93 00 10 00    // addi x1, x0, 1        ; x1 = 1
+13 01 20 00    // addi x2, x0, 2        ; x2 = 2
+
+63 84 20 00    // beq  x1, x2, +8       ; NOT taken (1 != 2), falls through
+
+13 05 10 00    // addi a0, x0, 1        ; PASS: a0 = 1
+6f 00 80 00    // jal  x0, +8           ; skip the FAIL block, jump to ebreak
+
+13 05 f0 ff    // addi a0, x0, -1       ; (FAIL path) would set a0 = -1
+73 00 10 00    // ebreak

@@ -1,0 +1,26 @@
+// Test program for pipeline hazards
+// Without NOPs - will fail on simple pipeline
+// L0: addi x7, x0, 0xf (0x00f00393)
+93 03 f0 00
+// L1: addi x1, x0, 10 (0x00a00093)
+93 00 a0 00
+// L2: addi x2, x1, 1 (0x00108113)
+13 81 10 00
+// L3: addi x3, x2, 1 (0x00110193)
+93 01 11 00
+// L4: addi x4, x3, 1 (0x00118213)
+13 82 11 00
+// L5: addi x5, x4, 1 (0x00120293)
+93 02 12 00
+// L6: addi x6, x5, 1 (0x00128313)
+13 83 12 00
+// L7: beq x6, x7, L10 (0x00730863 - offset=16 to skip 4 instructions)
+63 08 73 00
+// L8: lui a0, 0xdead (0xdead0537)
+37 05 ad de
+// L9: ebreak (0x00100073)
+73 00 10 00
+// L10: lui a0, 0x1 (0x00001537)
+37 15 00 00
+// L11: ebreak (0x00100073)
+73 00 10 00
